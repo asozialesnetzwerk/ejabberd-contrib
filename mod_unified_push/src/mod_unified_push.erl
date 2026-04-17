@@ -110,22 +110,31 @@ validate_request(_JwtToken, _Data, undefined) ->
     {400, [], []};
 validate_request(JwtToken, Data, Ttl) when Data =/= <<"">> ->
     ?DEBUG("verifying JWT validity", []),
-    {jose_jwt, #{?UP_HOST := Host}} = jose_jwt:peek(JwtToken),
-    try jose_jwt:verify(get_jwk(Host), JwtToken) of
-        {true, {jose_jwt, #{} = Fields}, _Signature} ->
-	        ?DEBUG("valid request, forwarding notification: ~p", [Fields]),
-	        forward_push_message(Host, Data, Ttl, Fields);
-        {false, _, _} ->
-            ?DEBUG("jose_jwt:verify failed for token: ~p", [JwtToken]),
-            {401, [], []}
-    catch
-        A:B ->
-            ?DEBUG(
-                "jose_jwt:verify failed for JWK and token: ~p~n with error: ~p",
-                [{get_jwk(Host), JwtToken}, {A, B}]
-            ),
-            {401, [], []}
-    end;
+    try jose_jwt:peek(JwtToken) of
+    	{jose_jwt, #{?UP_HOST := Host}} ->
+		    try jose_jwt:verify_strict(get_jwk(Host), ["HS256"], JwtToken) of
+		        {true, {jose_jwt, #{} = Fields}, _Signature} ->
+			        ?DEBUG("valid request, forwarding notification: ~p", [Fields]),
+			        forward_push_message(Host, Data, Ttl, Fields);
+		        {false, _, _} ->
+		            ?DEBUG("jose_jwt:verify failed for token: ~p", [JwtToken]),
+		            {401, [], []}
+		    catch
+		        A:B ->
+		            ?DEBUG(
+		                "jose_jwt:verify failed for JWK and token: ~p~n with error: ~p",
+		                [{get_jwk(Host), JwtToken}, {A, B}]
+		            ),
+		            {401, [], []}
+		    end
+	catch
+		A:B ->
+	        ?DEBUG(
+	            "jose_jwt:peek failed for token: ~p~n with error: ~p",
+	            [{JwtToken}, {A, B}]
+	        ),
+	        {401, [], []}
+	end;
 validate_request(_JwtToken, _Data, _Ttl) ->
     {400, [], []}.
 
