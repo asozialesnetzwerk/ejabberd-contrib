@@ -64,7 +64,6 @@
 
 %% Misc. string constants
 -define(XMLNS_UNIFIED_PUSH, <<"http://gultsch.de/xmpp/drafts/unified-push">>).
--define(UP_EXPIRATION, <<"e">>).
 -define(UP_OWNER, <<"o">>).
 -define(UP_APPLICATION, <<"a">>).
 -define(UP_INSTANCE, <<"i">>).
@@ -113,23 +112,9 @@ validate_request(JwtToken, Data, Ttl) when Data =/= <<"">> ->
     ?DEBUG("verifying JWT validity", []),
     {jose_jwt, #{?UP_HOST := Host}} = jose_jwt:peek(JwtToken),
     try jose_jwt:verify(get_jwk(Host), JwtToken) of
-        {true, {jose_jwt, #{?UP_EXPIRATION := _ExpTest} = Fields}, Signature} ->
-            Now = erlang:system_time(second),
-            ?DEBUG("JWT verify at system timestamp ~p: ~p - ~p~n", [Now, Fields, Signature]),
-            case maps:find(?UP_EXPIRATION, Fields) of
-                error ->
-                    ?DEBUG("rejecting JWT without exp(iry) field", []),
-                    {401, [], []};
-                {ok, Exp} ->
-                    if
-                        Exp > Now ->
-                            ?DEBUG("valid request, forwarding notification: ~p", [Fields]),
-                            forward_push_message(Host, Data, Ttl, Fields);
-                        true ->
-                            ?DEBUG("rejecting expired JWT: ~p > ~p", [Now, Exp]),
-                            {401, [], []}
-                    end
-            end;
+        {true, {jose_jwt, #{} = Fields}, _Signature} ->
+	        ?DEBUG("valid request, forwarding notification: ~p", [Fields]),
+	        forward_push_message(Host, Data, Ttl, Fields);
         {false, _, _} ->
             ?DEBUG("jose_jwt:verify failed for token: ~p", [JwtToken]),
             {401, [], []}
@@ -189,22 +174,18 @@ iq_handler(
     } = IQ
 ) ->
     ?DEBUG("processing unified push IQ: ~p", [IQ]),
-    %% TODO is non-monotonic time an issue here?
     Offset = gen_mod:get_module_opt(Host, ?MODULE, expiration),
-    {OldMegaSecs, OldSecs, MicroSecs} = os:timestamp(),
-    MegaSecs = OldMegaSecs + (OldSecs + Offset) div 1000_000,
-    Secs = (OldSecs + Offset) rem 1000_000,
-    Expiration = {MegaSecs, Secs, MicroSecs},
-    %% TODO what are sensible JW[STK] for this scenario?
-    Jws = #{<<"alg">> => <<"HS256">>},
+    Time = os:timestamp(s),
+    Expiration = Time + Offset,
+    Jwk = get_jwk(Host),
+    Jws = #{<<"alg">> => <<"HS256">>, <<"exp">> => Expiration},
     Jwt = #{
-        ?UP_EXPIRATION => MegaSecs * 1_000_000 + Secs,
         ?UP_OWNER => jid:encode(From),
         ?UP_APPLICATION => Application,
         ?UP_INSTANCE => Instance,
         ?UP_HOST => Host
     },
-    Signed = jose_jwt:sign(get_jwk(Host), Jws, Jwt),
+    Signed = jose_jwt:sign(Jwk, Jws, Jwt),
     {#{}, CompactSigned} = jose_jws:compact(Signed),
     UrlPrefix = get_push_url(Host),
     xmpp:make_iq_result(IQ, #unified_push_registered{
