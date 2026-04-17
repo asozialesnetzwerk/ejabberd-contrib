@@ -68,6 +68,7 @@
 -define(UP_OWNER, <<"o">>).
 -define(UP_APPLICATION, <<"a">>).
 -define(UP_INSTANCE, <<"i">>).
+-define(UP_HOST, <<"h">>).
 
 -define(MODULE_XMPP_UP, unifiedpush).
 
@@ -76,12 +77,10 @@
 process(_LocalPath, #request{method = 'POST', data = <<>>}) ->
     ?DEBUG("bad POST request for ~p: no data", [_LocalPath]),
     {400, [], []};
-process([<<?ENDPOINT_PUSH>>, MaybeJwtToken], #request{
-    method = 'POST', data = Data, headers = Headers, host = Host
+process([<<?ENDPOINT_PUSH>>, JwtToken], #request{
+    method = 'POST', data = Data, headers = Headers
 }) ->
-    Ttl = get_ttl(Headers),
-    Jwk = get_jwk(Host),
-    validate_request(Host, Jwk, MaybeJwtToken, Data, Ttl);
+    validate_request(JwtToken, Data, get_ttl(Headers));
 process([], #request{method = 'GET'}) ->
     {200,
         [
@@ -106,47 +105,48 @@ get_ttl(Headers) ->
             undefined
     end.
 
--spec validate_request(binary(), any(), binary(), binary(), ttl_timeout()) ->
+-spec validate_request(binary(), binary(), ttl_timeout()) ->
     {integer(), [{binary(), binary()}], []}.
-validate_request(_Host, _Jwk, _MaybeJwtToken, _Data, undefined) ->
+validate_request(_JwtToken, _Data, undefined) ->
     {400, [], []};
-validate_request(Host, Jwk, MaybeJwtToken, Data, Ttl) when Data =/= <<"">> ->
-    ?DEBUG("verifying jwt validity", []),
-    try jose_jwt:verify(Jwk, MaybeJwtToken) of
+validate_request(JwtToken, Data, Ttl) when Data =/= <<"">> ->
+    ?DEBUG("verifying JWT validity", []),
+    {jose_jwt, #{?UP_HOST := Host}} = jose_jwt:peek(JwtToken),
+    try jose_jwt:verify(get_jwk(Host), JwtToken) of
         {true, {jose_jwt, #{?UP_EXPIRATION := _ExpTest} = Fields}, Signature} ->
             Now = erlang:system_time(second),
-            ?DEBUG("jwt verify at system timestamp ~p: ~p - ~p~n", [Now, Fields, Signature]),
+            ?DEBUG("JWT verify at system timestamp ~p: ~p - ~p~n", [Now, Fields, Signature]),
             case maps:find(?UP_EXPIRATION, Fields) of
                 error ->
-                    ?DEBUG("rejecting jwt without exp(iry) field", []),
+                    ?DEBUG("rejecting JWT without exp(iry) field", []),
                     {401, [], []};
                 {ok, Exp} ->
                     if
                         Exp > Now ->
                             ?DEBUG("valid request, forwarding notification: ~p", [Fields]),
-                            forward_push_message(Host, MaybeJwtToken, Data, Ttl, Fields);
+                            forward_push_message(Host, Data, Ttl, Fields);
                         true ->
-                            ?DEBUG("rejecting expired jwt: ~p > ~p", [Now, Exp]),
+                            ?DEBUG("rejecting expired JWT: ~p > ~p", [Now, Exp]),
                             {401, [], []}
                     end
             end;
         {false, _, _} ->
-            ?DEBUG("jose_jwt:verify failed for token: ~p", [MaybeJwtToken]),
+            ?DEBUG("jose_jwt:verify failed for token: ~p", [JwtToken]),
             {401, [], []}
     catch
         A:B ->
             ?DEBUG(
                 "jose_jwt:verify failed for JWK and token: ~p~n with error: ~p",
-                [{Jwk, MaybeJwtToken}, {A, B}]
+                [{get_jwk(Host), JwtToken}, {A, B}]
             ),
             {401, [], []}
     end;
-validate_request(_Host, _Jwk, _MaybeJwtToken, _Data, _Ttl) ->
+validate_request(_JwtToken, _Data, _Ttl) ->
     {400, [], []}.
 
--spec forward_push_message(binary(), binary(), binary(), ttl_timeout(), map()) ->
+-spec forward_push_message(binary(), binary(), ttl_timeout(), map()) ->
     {integer(), [{binary(), binary()}], []}.
-forward_push_message(Host, Jwt, Data, Ttl, #{
+forward_push_message(Host, Data, Ttl, #{
     ?UP_APPLICATION := Application, ?UP_INSTANCE := Instance, ?UP_OWNER := To
 }) ->
     IQ = #iq{
@@ -175,7 +175,7 @@ forward_push_message(Host, Jwt, Data, Ttl, #{
     {201,
         [
             {<<"TTL">>, <<"0">>},
-            {<<"Location">>, <<UrlPrefix/binary, "/", ?ENDPOINT_MESSAGE, "/", Jwt/binary>>}
+            {<<"Location">>, <<UrlPrefix/binary, "/", ?ENDPOINT_MESSAGE, "/", "not-implemented">>}
         ],
         []}.
 
@@ -195,16 +195,16 @@ iq_handler(
     MegaSecs = OldMegaSecs + (OldSecs + Offset) div 1000_000,
     Secs = (OldSecs + Offset) rem 1000_000,
     Expiration = {MegaSecs, Secs, MicroSecs},
-    Jwk = get_jwk(Host),
     %% TODO what are sensible JW[STK] for this scenario?
     Jws = #{<<"alg">> => <<"HS256">>},
     Jwt = #{
         ?UP_EXPIRATION => MegaSecs * 1_000_000 + Secs,
         ?UP_OWNER => jid:encode(From),
         ?UP_APPLICATION => Application,
-        ?UP_INSTANCE => Instance
+        ?UP_INSTANCE => Instance,
+        ?UP_HOST => Host
     },
-    Signed = jose_jwt:sign(Jwk, Jws, Jwt),
+    Signed = jose_jwt:sign(get_jwk(Host), Jws, Jwt),
     {#{}, CompactSigned} = jose_jws:compact(Signed),
     UrlPrefix = get_push_url(Host),
     xmpp:make_iq_result(IQ, #unified_push_registered{
@@ -234,11 +234,15 @@ depends(_Host, _Opts) ->
 -spec get_jwk(binary()) -> any().
 get_jwk(Host) ->
     JwkOptions = gen_mod:get_module_opt(Host, ?MODULE, jwk),
-    jose_jwk:from_map(JwkOptions).
+    MapJwkOptions = if
+        is_list(JwkOptions) -> maps:from_list(JwkOptions);
+        is_map(JwkOptions) -> JwkOptions
+    end,
+    jose_jwk:from_map(MapJwkOptions).
 
 -spec mod_opt_type(atom()) -> econf:validator().
 mod_opt_type(expiration) ->
-    econf:int(0, 5184000); %% 86400 * 60
+    econf:pos_int(infinity);
 mod_opt_type(jwk) ->
     econf:map(econf:binary(), econf:either(econf:binary(), econf:int()));
 mod_opt_type(push_url) ->
@@ -314,7 +318,7 @@ mod_doc() ->
             "",
             "modules:",
             "  mod_unified_push:",
-            "    expiration: 259200",
+            "    expiration: 2592000",
             "    jwk: {\"k\" => \"a4-...\",\"kty\" => \"oct\"}"
         ]
     }.
