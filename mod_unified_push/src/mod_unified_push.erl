@@ -184,7 +184,7 @@ iq_handler(
 ) ->
     ?DEBUG("processing unified push IQ: ~p", [IQ]),
     Offset = gen_mod:get_module_opt(Host, ?MODULE, expiration),
-    Time = os:timestamp(s),
+    Time = erlang:timestamp(second),
     Expiration = Time + Offset,
     Jwk = get_jwk(Host),
     Jws = #{<<"alg">> => <<"HS256">>, <<"exp">> => Expiration},
